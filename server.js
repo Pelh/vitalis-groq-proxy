@@ -1,15 +1,13 @@
-// groq-proxy/server.js — Groq key rotation proxy for EHS app
 const express = require('express');
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 
-// ── Key rotation ────────────────────────────────────────────────
-// Replace KEY_1/KEY_2/KEY_3 with your actual Groq API keys
+// ── Key rotation ─────────────────────────────────────────────
 const GROQ_KEYS = [
-  process.env.GROQ_KEY_1 || 'REPLACE_WITH_GROQ_KEY_1',
-  process.env.GROQ_KEY_2 || 'REPLACE_WITH_GROQ_KEY_2',
-  process.env.GROQ_KEY_3 || 'REPLACE_WITH_GROQ_KEY_3',
-].filter(k => k && !k.startsWith('REPLACE'));
+  process.env.GROQ_KEY_1,
+  process.env.GROQ_KEY_2,
+  process.env.GROQ_KEY_3,
+].filter(Boolean);
 
 let keyIndex = 0;
 function nextKey() {
@@ -18,45 +16,52 @@ function nextKey() {
   return key;
 }
 
-// ── Health check ────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', keys: GROQ_KEYS.length, version: '1.0.0' });
+// ── Health check ─────────────────────────────────────────────
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', keys: GROQ_KEYS.length, version: '1.1.0' });
 });
 
-// ── Chat completions proxy ──────────────────────────────────────
+// ── Proxy ─────────────────────────────────────────────────────
 app.post('/v1/chat/completions', async (req, res) => {
   if (GROQ_KEYS.length === 0) {
-    return res.status(500).json({ error: 'No API keys configured' });
+    return res.status(500).json({ error: 'No GROQ_KEY_* env vars configured' });
   }
 
-  const MAX_RETRIES = GROQ_KEYS.length;
-  let lastError = null;
+  let lastStatus = 500;
+  let lastBody   = {};
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < GROQ_KEYS.length; attempt++) {
     const key = nextKey();
     try {
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
-        body:    JSON.stringify(req.body),
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${key}`,
+        },
+        body: JSON.stringify(req.body),
       });
 
-      if (response.status === 429 && attempt < MAX_RETRIES - 1) {
-        // Rate limited — try next key
-        lastError = { status: 429, message: 'Rate limited, rotating key' };
-        await new Promise(r => setTimeout(r, 500));
+      lastStatus = response.status;
+      lastBody   = await response.json();
+
+      if (response.status === 429 && attempt < GROQ_KEYS.length - 1) {
+        await new Promise(r => setTimeout(r, 300));
         continue;
       }
 
-      const data = await response.json();
-      return res.status(response.status).json(data);
+      return res.status(lastStatus).json(lastBody);
     } catch (err) {
-      lastError = err;
+      console.error(`[proxy] attempt ${attempt + 1} error:`, err.message);
     }
   }
 
-  res.status(500).json({ error: 'All keys exhausted', detail: String(lastError) });
+  res.status(lastStatus).json(lastBody);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Groq proxy running on port ${PORT}`));
+// ── Start ─────────────────────────────────────────────────────
+const PORT = parseInt(process.env.PORT || '3000', 10);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Groq proxy v1.1.0 listening on 0.0.0.0:${PORT}`);
+  console.log(`Keys loaded: ${GROQ_KEYS.length}`);
+});
