@@ -2,6 +2,15 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 
+// ── CORS ─────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // ── Key rotation ─────────────────────────────────────────────
 const GROQ_KEYS = [
   process.env.GROQ_KEY_1,
