@@ -235,19 +235,31 @@ async function updateProfileByCustomer(customerId, values) {
   return res.error ?? null;
 }
 
+function thirtyDaysFromNowIso() {
+  return new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+}
+
+// La fin de periode a ete deplacee de la Subscription vers l'item de
+// subscription dans les versions recentes de l'API Stripe (2025+). On tente les
+// deux emplacements pour rester compatible avec toutes les versions.
+function subscriptionPeriodEndIso(subscription) {
+  const ts = subscription?.current_period_end
+    ?? subscription?.items?.data?.[0]?.current_period_end;
+  return ts ? new Date(ts * 1000).toISOString() : null;
+}
+
 async function getSubscriptionExpiresAt(session) {
   if (session.subscription && stripe) {
     try {
       const subscription = await stripe.subscriptions.retrieve(session.subscription);
-      if (subscription.current_period_end) {
-        return new Date(subscription.current_period_end * 1000).toISOString();
-      }
+      const iso = subscriptionPeriodEndIso(subscription);
+      if (iso) return iso;
     } catch (err) {
       console.error('[stripe] subscription period lookup error:', err.message);
     }
   }
 
-  return new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  return thirtyDaysFromNowIso();
 }
 
 // Public URL used in Stripe redirects. On Infomaniak, set PUBLIC_PROXY_BASE.
@@ -425,7 +437,7 @@ app.get('/', (_req, res) => {
   res.json({
     status:  'ok',
     keys:    AI_KEYS.length,
-    version: '1.5.1',
+    version: '1.5.2',
     stripe:  !!stripe,
     stripeWebhook: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiAuth:  true,
@@ -674,8 +686,10 @@ app.post('/webhook', async (req, res) => {
       const planId = normalizePlanId(resolvePlanFromSubscription(subscription) ?? 'solo') ?? 'solo';
       const planMeta = PLAN_META[planId];
       const isActive = ['active', 'trialing'].includes(subscription.status);
-      const expires = isActive && subscription.current_period_end
-        ? new Date(subscription.current_period_end * 1000).toISOString()
+      // Tant que l'abonnement est actif, on garantit une date future (jamais
+      // null) pour ne pas re-bloquer l'acces a cause d'un champ Stripe absent.
+      const expires = isActive
+        ? (subscriptionPeriodEndIso(subscription) ?? thirtyDaysFromNowIso())
         : null;
 
       const error = await updateProfileByCustomer(customerId, {
@@ -694,18 +708,17 @@ app.post('/webhook', async (req, res) => {
       else console.log(`[webhook] subscription ${subscription.status} for customer=${customerId}`);
     }
 
-    if (event.type === 'invoice.paid') {
+    if (event.type === 'invoice.paid' || event.type === 'invoice.payment_succeeded') {
       const invoice = event.data.object;
-      const subscriptionId = typeof invoice.subscription === 'string'
-        ? invoice.subscription
-        : invoice.subscription?.id;
+      const subRef = invoice.subscription
+        ?? invoice.parent?.subscription_details?.subscription
+        ?? invoice.lines?.data?.[0]?.subscription;
+      const subscriptionId = typeof subRef === 'string' ? subRef : subRef?.id;
       if (subscriptionId) {
         const subscription = await stripe.subscriptions.retrieve(subscriptionId);
         const planId = normalizePlanId(resolvePlanFromSubscription(subscription) ?? 'solo') ?? 'solo';
         const planMeta = PLAN_META[planId];
-        const expires = subscription.current_period_end
-          ? new Date(subscription.current_period_end * 1000).toISOString()
-          : null;
+        const expires = subscriptionPeriodEndIso(subscription) ?? thirtyDaysFromNowIso();
 
         const error = await updateProfileByCustomer(subscription.customer, {
           plan:                    planId,
@@ -869,13 +882,13 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'groq-proxy',
-    version: '1.5.1',
+    version: '1.5.2',
     timestamp: new Date().toISOString()
   });
 });
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Vitalis AI proxy v1.5.1 listening on 0.0.0.0:${PORT}`);
+  console.log(`Vitalis AI proxy v1.5.2 listening on 0.0.0.0:${PORT}`);
   console.log(`AI provider: ${AI_PROVIDER_NAME} (${AI_PROVIDER_BASE_URL})`);
   console.log(`AI keys loaded: ${AI_KEYS.length}`);
   console.log(`Stripe: ${stripe ? 'configured' : 'NOT configured'}`);
