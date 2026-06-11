@@ -205,27 +205,34 @@ async function ensureProfileForAuthUser(authUser) {
 }
 
 async function updateProfileById(userId, values) {
-  const { error } = await supabase.from('profiles').update(values).eq('id', userId);
-  if (!error) return null;
-
-  const message = String(error.message || '');
-  if (message.includes('plan') || message.includes('max_auditors') || message.includes('schema cache')) {
-    const fallback = await supabase.from('profiles').update(legacySafeValues(values)).eq('id', userId);
-    return fallback.error ?? null;
+  // .select('id') nous permet de connaitre le NOMBRE de lignes reellement
+  // modifiees : 0 ligne sans erreur = ecriture bloquee par la RLS (cle non
+  // service_role). On le journalise explicitement.
+  let res = await supabase.from('profiles').update(values).eq('id', userId).select('id');
+  if (res.error) {
+    const message = String(res.error.message || '');
+    if (message.includes('plan') || message.includes('max_auditors') || message.includes('schema cache')) {
+      res = await supabase.from('profiles').update(legacySafeValues(values)).eq('id', userId).select('id');
+    }
   }
-  return error;
+  if (!res.error && (!res.data || res.data.length === 0)) {
+    console.error(`[webhook] UPDATE by id a modifie 0 ligne (id=${userId}). Cause probable: SUPABASE_SERVICE_KEY n'est PAS la cle service_role -> la RLS bloque l'ecriture.`);
+  }
+  return res.error ?? null;
 }
 
 async function updateProfileByCustomer(customerId, values) {
-  const { error } = await supabase.from('profiles').update(values).eq('stripe_customer_id', customerId);
-  if (!error) return null;
-
-  const message = String(error.message || '');
-  if (message.includes('plan') || message.includes('max_auditors') || message.includes('schema cache')) {
-    const fallback = await supabase.from('profiles').update(legacySafeValues(values)).eq('stripe_customer_id', customerId);
-    return fallback.error ?? null;
+  let res = await supabase.from('profiles').update(values).eq('stripe_customer_id', customerId).select('id');
+  if (res.error) {
+    const message = String(res.error.message || '');
+    if (message.includes('plan') || message.includes('max_auditors') || message.includes('schema cache')) {
+      res = await supabase.from('profiles').update(legacySafeValues(values)).eq('stripe_customer_id', customerId).select('id');
+    }
   }
-  return error;
+  if (!res.error && (!res.data || res.data.length === 0)) {
+    console.error(`[webhook] UPDATE by customer a modifie 0 ligne (customer=${customerId}). Cause probable: cle non service_role (RLS) ou stripe_customer_id absent du profil.`);
+  }
+  return res.error ?? null;
 }
 
 async function getSubscriptionExpiresAt(session) {
@@ -418,7 +425,7 @@ app.get('/', (_req, res) => {
   res.json({
     status:  'ok',
     keys:    AI_KEYS.length,
-    version: '1.5.0',
+    version: '1.5.1',
     stripe:  !!stripe,
     stripeWebhook: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiAuth:  true,
@@ -862,13 +869,13 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'groq-proxy',
-    version: '1.5.0',
+    version: '1.5.1',
     timestamp: new Date().toISOString()
   });
 });
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Vitalis AI proxy v1.5.0 listening on 0.0.0.0:${PORT}`);
+  console.log(`Vitalis AI proxy v1.5.1 listening on 0.0.0.0:${PORT}`);
   console.log(`AI provider: ${AI_PROVIDER_NAME} (${AI_PROVIDER_BASE_URL})`);
   console.log(`AI keys loaded: ${AI_KEYS.length}`);
   console.log(`Stripe: ${stripe ? 'configured' : 'NOT configured'}`);
