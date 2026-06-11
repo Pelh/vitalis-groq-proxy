@@ -4,9 +4,11 @@ const stripeSecretKey = process.env.STRIPE_SECRET_KEY || '';
 const stripe = stripeSecretKey ? require('stripe')(stripeSecretKey) : null;
 const { createClient } = require('@supabase/supabase-js');
 
+// Accepte les deux noms de variable courants pour la clé service-role
+// (évite un crash au démarrage si elle est nommée SUPABASE_SERVICE_ROLE_KEY).
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
+  process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY,
 );
 
 // Maps plan IDs (used in the app) to Stripe price env vars
@@ -134,6 +136,72 @@ function resolvePlanFromSubscription(subscription) {
 function legacySafeValues(values) {
   const { plan, max_auditors, ...legacyValues } = values;
   return legacyValues;
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
+}
+
+function profileSeedValues(authUser) {
+  const meta = authUser?.user_metadata || {};
+  const fullName = String(meta.full_name || meta.name || authUser?.email || 'Utilisateur').trim() || 'Utilisateur';
+  const orgId = isUuid(meta.org_id) ? meta.org_id : authUser.id;
+
+  return {
+    id: authUser.id,
+    full_name: fullName,
+    role: 'auditor',
+    org_id: orgId,
+    org_name: meta.org_name || null,
+    company: meta.company || null,
+    is_blocked: true,
+    approval_status: 'pending',
+    plan: null,
+    max_auditors: 0,
+    subscription_plan: 'none',
+  };
+}
+
+async function ensureProfileForAuthUser(authUser) {
+  const selectedColumns = 'id, role, org_id, is_blocked, approval_status';
+  const existing = await supabase
+    .from('profiles')
+    .select(selectedColumns)
+    .eq('id', authUser.id)
+    .maybeSingle();
+
+  if (existing.data) return { profile: existing.data, error: null };
+
+  const values = profileSeedValues(authUser);
+  let inserted = await supabase
+    .from('profiles')
+    .insert(values)
+    .select(selectedColumns)
+    .single();
+
+  if (inserted.error) {
+    const message = String(inserted.error.message || '');
+    if (message.includes('plan') || message.includes('max_auditors') || message.includes('schema cache')) {
+      inserted = await supabase
+        .from('profiles')
+        .insert(legacySafeValues(values))
+        .select(selectedColumns)
+        .single();
+    }
+  }
+
+  if (!inserted.error && inserted.data) return { profile: inserted.data, error: null };
+
+  // Race condition: the Supabase trigger may have inserted the row between
+  // the initial read and our insert. Re-read before reporting a real failure.
+  const reread = await supabase
+    .from('profiles')
+    .select(selectedColumns)
+    .eq('id', authUser.id)
+    .maybeSingle();
+
+  if (reread.data) return { profile: reread.data, error: null };
+  return { profile: null, error: inserted.error || reread.error || existing.error };
 }
 
 async function updateProfileById(userId, values) {
@@ -350,7 +418,7 @@ app.get('/', (_req, res) => {
   res.json({
     status:  'ok',
     keys:    AI_KEYS.length,
-    version: '1.4.0',
+    version: '1.5.0',
     stripe:  !!stripe,
     stripeWebhook: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiAuth:  true,
@@ -422,17 +490,16 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 
   try {
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('id, role, org_id, is_blocked, approval_status')
-      .eq('id', authUser.id)
-      .single();
+    const { profile, error: profileError } = await ensureProfileForAuthUser(authUser);
 
     if (profileError || !profile) {
-      return res.status(403).json({ error: 'User profile not found' });
+      console.error('[stripe] profile ensure error:', profileError?.message || profileError);
+      return res.status(500).json({ error: 'Unable to prepare user profile for payment' });
     }
-    if (profile.role !== 'admin' && (profile.is_blocked || profile.approval_status !== 'approved')) {
-      return res.status(403).json({ error: 'Account must be approved by an administrator before payment' });
+    const rejected = profile.approval_status === 'rejected';
+    const suspendedApprovedAccount = profile.approval_status === 'approved' && profile.is_blocked === true;
+    if (profile.role !== 'admin' && (rejected || suspendedApprovedAccount)) {
+      return res.status(403).json({ error: 'Account cannot start payment because it is rejected or suspended' });
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -585,6 +652,9 @@ app.post('/webhook', async (req, res) => {
         subscription_plan:       planMeta.legacyPlan,
         subscription_expires_at: expires,
         stripe_customer_id:      session.customer,
+        is_blocked:              false,
+        approval_status:         'approved',
+        approved_at:             new Date().toISOString(),
       });
 
       if (error) console.error('[webhook] supabase update error:', error.message);
@@ -606,6 +676,11 @@ app.post('/webhook', async (req, res) => {
         max_auditors:            isActive ? planMeta.maxAuditors : 0,
         subscription_plan:       isActive ? planMeta.legacyPlan : 'none',
         subscription_expires_at: expires,
+        ...(isActive ? {
+          is_blocked:      false,
+          approval_status: 'approved',
+          approved_at:     new Date().toISOString(),
+        } : {}),
       });
 
       if (error) console.error('[webhook] subscription update error:', error.message);
@@ -630,6 +705,9 @@ app.post('/webhook', async (req, res) => {
           max_auditors:            planMeta.maxAuditors,
           subscription_plan:       planMeta.legacyPlan,
           subscription_expires_at: expires,
+          is_blocked:              false,
+          approval_status:         'approved',
+          approved_at:             new Date().toISOString(),
         });
 
         if (error) console.error('[webhook] invoice paid update error:', error.message);
@@ -784,13 +862,13 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'groq-proxy',
-    version: '1.4.0',
+    version: '1.5.0',
     timestamp: new Date().toISOString()
   });
 });
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Vitalis AI proxy v1.4.0 listening on 0.0.0.0:${PORT}`);
+  console.log(`Vitalis AI proxy v1.5.0 listening on 0.0.0.0:${PORT}`);
   console.log(`AI provider: ${AI_PROVIDER_NAME} (${AI_PROVIDER_BASE_URL})`);
   console.log(`AI keys loaded: ${AI_KEYS.length}`);
   console.log(`Stripe: ${stripe ? 'configured' : 'NOT configured'}`);
