@@ -305,6 +305,8 @@ const AI_PROVIDER_NAME = process.env.AI_PROVIDER_NAME || 'groq';
 const AI_PROVIDER_BASE_URL = (process.env.AI_PROVIDER_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
 const AI_CHAT_ENDPOINT = process.env.AI_CHAT_ENDPOINT || '/chat/completions';
 const AI_AUDIO_ENDPOINT = process.env.AI_AUDIO_ENDPOINT || '/audio/transcriptions';
+const AI_CHAT_MODEL_OVERRIDE = (process.env.AI_CHAT_MODEL_OVERRIDE || '').trim();
+const AI_VISION_MODEL_OVERRIDE = (process.env.AI_VISION_MODEL_OVERRIDE || 'qwen/qwen3.6-27b').trim();
 const EXPO_PUSH_URL = process.env.EXPO_PUSH_URL || 'https://exp.host/--/api/v2/push/send';
 const AI_KEYS = [
   process.env.AI_API_KEY,
@@ -325,6 +327,22 @@ function nextKey() {
 
 function providerUrl(path) {
   return `${AI_PROVIDER_BASE_URL}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function hasVisionContent(messages) {
+  return Array.isArray(messages) && messages.some(message =>
+    Array.isArray(message?.content) && message.content.some(part =>
+      part?.type === 'image_url' || part?.type === 'input_image' || !!part?.image_url,
+    ),
+  );
+}
+
+function providerRequestBody(body) {
+  if (!body || typeof body !== 'object') return body;
+  const override = hasVisionContent(body.messages)
+    ? (AI_VISION_MODEL_OVERRIDE || AI_CHAT_MODEL_OVERRIDE)
+    : AI_CHAT_MODEL_OVERRIDE;
+  return override ? { ...body, model: override } : body;
 }
 
 const AI_CACHE_TTL_MS = parseInt(process.env.AI_CACHE_TTL_MS || '300000', 10);
@@ -448,6 +466,8 @@ app.get('/', (_req, res) => {
       baseConfigured: !!AI_PROVIDER_BASE_URL,
       chatEndpoint: AI_CHAT_ENDPOINT,
       audioEndpoint: AI_AUDIO_ENDPOINT,
+      chatModelOverride: !!AI_CHAT_MODEL_OVERRIDE,
+      visionModelOverride: !!AI_VISION_MODEL_OVERRIDE,
     },
     aiCache: {
       ttlMs: AI_CACHE_TTL_MS,
@@ -782,8 +802,9 @@ app.post('/v1/chat/completions', requireApprovedAiUser, rateLimitAi, async (req,
   }
 
   const startedAt = Date.now();
-  const canCache = !req.body?.stream;
-  const cacheKey = canCache ? aiCacheKey(req, 'chat') : null;
+  const requestBody = providerRequestBody(req.body);
+  const canCache = !requestBody?.stream;
+  const cacheKey = canCache ? aiCacheKey({ ...req, body: requestBody }, 'chat') : null;
   if (cacheKey) {
     const cached = readAiCache(cacheKey);
     if (cached) {
@@ -804,7 +825,7 @@ app.post('/v1/chat/completions', requireApprovedAiUser, rateLimitAi, async (req,
           'Content-Type':  'application/json',
           'Authorization': `Bearer ${key}`,
         },
-        body: JSON.stringify(req.body),
+        body: JSON.stringify(requestBody),
       });
 
       lastStatus = response.status;
